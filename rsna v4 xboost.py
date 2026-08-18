@@ -3,7 +3,7 @@
 # Full pipeline: DICOM → MedSigLIP → Attention Model → Submission
 #
 # Kaggle paths:
-#   Data    : /kaggle/input/rsna-knee-abnormality-detection/
+#   Data    : /kaggle/input/rsna-knee-abnormality-2024/
 #   MedSigLIP: /kaggle/input/medsiglip/
 #   Output  : /kaggle/working/
 # ============================================================
@@ -33,11 +33,16 @@ from sklearn.decomposition import PCA
 # ── config ────────────────────────────────────────────────────────────────────
 IS_KAGGLE     = os.path.exists("/kaggle/input")
 
+# Linux SSH/GPU server (not Kaggle, not the local Windows dev machine).
+# Same server layout used by RSNA v4.
+IS_SERVER     = (not IS_KAGGLE) and os.name == "posix"
+SERVER_ROOT   = Path("/home/harleen_ece/rsna_knee_ai")
+
 def _find_data_root():
     # Handles both the raw competition dataset and a manually-renamed copy.
     candidates = [
-        Path("/kaggle/input/rsna-knee-abnormality-detection"),
         Path("/kaggle/input/competitions/rsna-knee-abnormality-detection"),
+        Path("/kaggle/input/rsna-knee-abnormality-detection"),
         Path("/kaggle/input/rsna-knee-abnormality-2024"),
     ]
     for c in candidates:
@@ -56,14 +61,21 @@ def _find_data_root():
         "Attach the RSNA Knee Abnormality Detection competition data to this notebook."
     )
 
-DATA_ROOT     = _find_data_root() if IS_KAGGLE else Path("C:/kabir/RSNA_Knee_AI/DATA")
+if IS_KAGGLE:
+    DATA_ROOT = _find_data_root()
+elif IS_SERVER:
+    DATA_ROOT = Path("/home/harleen_ece/rsna_knee_ai/DATA")
+else:
+    DATA_ROOT = Path("C:/kabir/RSNA_Knee_AI/DATA")
 
+# auto-find MedSigLIP on Kaggle — handles subfolder variations
 def _find_medsiglip():
+    # kabirverma01/medsiglip dataset — files are in root
     candidates = [
-        Path("/kaggle/input/medsiglip"),
-        Path("/kaggle/input/datasets/kabirverma01/medsiglip/MedSigLIP"),
+        Path("/kaggle/input/datasets/kabirverma01/medsiglip/MedSigLIP"),  # confirmed actual path
         Path("/kaggle/input/datasets/kabirverma01/medsiglip"),
-        Path("/kaggle/input/medsiglip/MedSigLIP"),
+        Path("/kaggle/input/medsiglip"),           # dataset slug = medsiglip
+        Path("/kaggle/input/medsiglip/MedSigLIP"), # if Kaggle adds subfolder
     ]
     for c in candidates:
         if (c / "config.json").exists():
@@ -82,8 +94,20 @@ def _find_medsiglip():
         "Attach dataset kabirverma01/medsiglip to this notebook."
     )
 
-MODEL_PATH = _find_medsiglip() if IS_KAGGLE else Path("C:/kabir/RSNA_Knee_AI/MedSigLIP")
-WORK_DIR      = Path("/kaggle/working")                          if IS_KAGGLE else Path("C:/kabir/RSNA/kaggle_run")
+if IS_KAGGLE:
+    MODEL_PATH = _find_medsiglip()
+elif IS_SERVER:
+    MODEL_PATH = Path("/home/harleen_ece/rsna_knee_ai/MedSigLIP")
+else:
+    MODEL_PATH = Path("C:/kabir/RSNA_Knee_AI/MedSigLIP")
+
+if IS_KAGGLE:
+    WORK_DIR = Path("/kaggle/working")
+elif IS_SERVER:
+    WORK_DIR = SERVER_ROOT / "kaggle_run"
+else:
+    WORK_DIR = Path("C:/kabir/RSNA/kaggle_run")
+
 TRAIN_SERIES  = DATA_ROOT / "train_series"
 TEST_SERIES   = DATA_ROOT / "test_series"
 EMB_DIR       = WORK_DIR / "embeddings"
@@ -93,6 +117,10 @@ EMB_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 def _kaggle_dataset_variants(slug):
+    """
+    Kaggle sometimes mounts an attached dataset at /kaggle/input/<slug>
+    and sometimes nests it under /kaggle/input/datasets/<username>/<slug>.
+    """
     base = Path("/kaggle/input")
     variants = [base / slug]
     datasets_dir = base / "datasets"
@@ -132,22 +160,37 @@ if IS_KAGGLE:
     else:
         print("  No previous-run cache dataset found — starting fresh.")
 
-TRAIN_SERIES_ZIP = Path(r"D:\rsna-knee-abnormality-detection.zip") if not IS_KAGGLE else None
+# Local Windows zip path from RSNA v4. It is intentionally unused on Kaggle
+# and on the Linux GPU server because those environments already have data.
+TRAIN_SERIES_ZIP = (
+    Path(r"D:\rsna-knee-abnormality-detection.zip")
+    if (not IS_KAGGLE and not IS_SERVER) else None
+)
 
+# Parser output used as the label source.
 if IS_KAGGLE:
     _parsed_candidates = [
-        Path("/kaggle/input/rsna-knee-labels/final_labels_real_plus_generated.csv"),
-        DATA_ROOT / "final_labels_real_plus_generated.csv"
+        v / "final_labels_real_plus_generated.csv"
+        for v in _kaggle_dataset_variants("final-labels-real-plus-generated")
     ]
-    _parsed_candidates += [v / "final_labels_real_plus_generated.csv"
-                           for v in _kaggle_dataset_variants("final-labels-real-plus-generated")]
-    _parsed_candidates += [v / "final_labels_real_plus_generated.csv"
-                           for v in _kaggle_dataset_variants("rsna-knee-labels")]
-    PARSED_LABELS_CSV = next((p for p in _parsed_candidates if p.exists()), _parsed_candidates[0])
+    _parsed_candidates += [
+        v / "final_labels_real_plus_generated.csv"
+        for v in _kaggle_dataset_variants("rsna-knee-labels")
+    ]
+    _parsed_candidates.append(DATA_ROOT / "final_labels_real_plus_generated.csv")
+    PARSED_LABELS_CSV = next(
+        (p for p in _parsed_candidates if p.exists()), _parsed_candidates[0]
+    )
+elif IS_SERVER:
+    PARSED_LABELS_CSV = Path(
+        "/home/harleen_ece/rsna_knee_ai/AI-MODEL/final_labels_real_plus_generated.csv"
+    )
 else:
-    PARSED_LABELS_CSV = Path(r"C:\kabir\RSNA_Knee_AI\parser\output\final_labels_real_plus_generated.csv")
+    PARSED_LABELS_CSV = Path(
+        r"C:\kabir\RSNA_Knee_AI\parser\output\final_labels_real_plus_generated.csv"
+    )
 
-N_TOTAL_STUDIES = 3000  # Updated study count
+N_TOTAL_STUDIES = 3000  # Gemini code's existing setting
 SAMPLE_SEED     = 42
 
 # ── constants ─────────────────────────────────────────────────────────────────
