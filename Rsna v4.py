@@ -197,6 +197,20 @@ else:
 N_TOTAL_STUDIES = 1000  # 58 real-labeled + (N_TOTAL_STUDIES - 58) weak-labeled
 SAMPLE_SEED     = 42
 
+# Hyperparameter search (Optuna) for Stage A / Stage B learning rate,
+# weight decay, and epoch count. Off by default on Kaggle (session time is
+# limited there) — on by default on the server (IS_SERVER), since GPU time
+# isn't a hard constraint when training happens on your own H100 and only
+# the resulting weights get uploaded to Kaggle for test-only inference.
+RUN_HPARAM_SEARCH = IS_SERVER
+HPARAM_SEARCH_TRIALS_STAGE_A = 12
+HPARAM_SEARCH_TRIALS_STAGE_B = 15
+# Stage A search uses a single held-out fold (not full 5-fold CV) per
+# trial to keep search cost reasonable — full 5-fold CV is still used for
+# the final Stage A training run with the winning hyperparameters.
+HPARAM_SEARCH_STAGE_A_EPOCHS = 15  # shorter than the final 30, just for search ranking
+HPARAM_SEARCH_STAGE_B_EPOCHS = 15
+
 # ── constants ─────────────────────────────────────────────────────────────────
 TARGETS = [
     "ACL", "MCL", "Medial Meniscus", "Lateral Meniscus",
@@ -796,14 +810,88 @@ def auc_mean(y_true, y_pred):
     return float(np.mean(vals)) if vals else float("nan")
 
 
-def train_fold(train_ds, val_ds, device, epochs):
+def search_stage_a_hparams(pretrain_ids, emb, lbl, device, n_trials):
+    """
+    Optuna search over Stage A (weak-label pretrain) learning rate and
+    weight decay, using a single 80/20 held-out split (not full 5-fold —
+    kept cheap since this runs once per trial, and the winning hparams get
+    re-validated properly via full 5-fold CV in the real Stage A run after).
+    Returns the best {lr, weight_decay} dict found.
+    """
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    rng = np.random.RandomState(SAMPLE_SEED)
+    perm = rng.permutation(len(pretrain_ids))
+    n_val = max(1, int(0.2 * len(pretrain_ids)))
+    val_ids = pretrain_ids[perm[:n_val]]
+    tr_ids  = pretrain_ids[perm[n_val:]]
+    tr_ds = StudyDataset(emb[emb["StudyInstanceUID"].isin(tr_ids)],
+                         lbl[lbl["StudyInstanceUID"].isin(tr_ids)])
+    va_ds = StudyDataset(emb[emb["StudyInstanceUID"].isin(val_ids)],
+                         lbl[lbl["StudyInstanceUID"].isin(val_ids)])
+
+    def objective(trial):
+        lr = trial.suggest_float("lr", 1e-5, 5e-4, log=True)
+        weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-2, log=True)
+        _, auc = train_fold(tr_ds, va_ds, device, epochs=HPARAM_SEARCH_STAGE_A_EPOCHS,
+                            lr=lr, weight_decay=weight_decay)
+        return auc if not np.isnan(auc) else 0.0
+
+    print(f"\n── Stage A hyperparameter search: {n_trials} trials ──")
+    study = optuna.create_study(direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=SAMPLE_SEED))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    print(f"  Best Stage A trial: AUC={study.best_value:.5f}  params={study.best_params}")
+    return study.best_params
+
+
+def search_stage_b_hparams(real_emb, real_lbl, pretrained_state, device, n_trials):
+    """
+    Optuna search over Stage B (fine-tune on the 58 real studies) learning
+    rate and weight decay, using a single fold split. The winning hparams
+    get used for the real 5-fold Stage B run afterward.
+    """
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    ids = sorted(real_lbl["StudyInstanceUID"].unique())
+    rng = np.random.RandomState(SAMPLE_SEED)
+    perm = rng.permutation(len(ids))
+    n_val = max(1, int(0.2 * len(ids)))
+    val_ids = [ids[i] for i in perm[:n_val]]
+    tr_ids  = [ids[i] for i in perm[n_val:]]
+    tr_ds = StudyDataset(real_emb[real_emb["StudyInstanceUID"].isin(tr_ids)],
+                         real_lbl[real_lbl["StudyInstanceUID"].isin(tr_ids)])
+    va_ds = StudyDataset(real_emb[real_emb["StudyInstanceUID"].isin(val_ids)],
+                         real_lbl[real_lbl["StudyInstanceUID"].isin(val_ids)])
+
+    def objective(trial):
+        lr = trial.suggest_float("lr", 1e-6, 1e-4, log=True)
+        weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-2, log=True)
+        model = SlotAttentionModel().to(device)
+        model = load_state_dict_safe(model, pretrained_state)
+        _, auc = finetune_fold(model, tr_ds, va_ds, device,
+                               epochs=HPARAM_SEARCH_STAGE_B_EPOCHS,
+                               lr=lr, weight_decay=weight_decay)
+        return auc if not np.isnan(auc) else 0.0
+
+    print(f"\n── Stage B hyperparameter search: {n_trials} trials ──")
+    study = optuna.create_study(direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=SAMPLE_SEED))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    print(f"  Best Stage B trial: AUC={study.best_value:.5f}  params={study.best_params}")
+    return study.best_params
+
+
+def train_fold(train_ds, val_ds, device, epochs, lr=1e-4, weight_decay=1e-4):
     model   = SlotAttentionModel().to(device)
     # torch.compile gives ~15% speedup on PyTorch 2.0+ (safe, no result change)
     try:
         model = torch.compile(model)
     except Exception:
         pass  # older PyTorch — skip compile
-    opt     = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    opt     = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scaler  = torch.amp.GradScaler("cuda", enabled=device.type=="cuda")
     yy      = np.vstack([train_ds.labels.loc[s, TARGETS].astype(float).values
                          for s in train_ds.ids])
@@ -850,16 +938,16 @@ def train_fold(train_ds, val_ds, device, epochs):
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
     if best_state: model.load_state_dict(best_state)
-    return model
+    return model, best_auc
 
 
-def finetune_fold(model, train_ds, val_ds, device, epochs, lr=2e-5):
+def finetune_fold(model, train_ds, val_ds, device, epochs, lr=2e-5, weight_decay=1e-4):
     """
     Same loop as train_fold, but takes an already-initialized model (e.g.
     Stage A weak-label weights) and fine-tunes it with a smaller LR instead
     of training from scratch. Used for Stage B (58 real labels).
     """
-    opt     = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    opt     = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scaler  = torch.amp.GradScaler("cuda", enabled=device.type=="cuda")
     yy      = np.vstack([train_ds.labels.loc[s, TARGETS].astype(float).values
                          for s in train_ds.ids])
@@ -899,7 +987,7 @@ def finetune_fold(model, train_ds, val_ds, device, epochs, lr=2e-5):
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
     if best_state: model.load_state_dict(best_state)
-    return model
+    return model, best_auc
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1065,7 +1153,13 @@ def main():
         pretrained_model = load_state_dict_safe(pretrained_model, ckpt["model_state_dict"])
         best_stage_a_auc = None
     else:
-        print(f"Stage A: 5-fold CV on {len(pretrain_ids)} studies")
+        stage_a_hparams = {"lr": 1e-4, "weight_decay": 1e-4}
+        if RUN_HPARAM_SEARCH:
+            stage_a_hparams = search_stage_a_hparams(pretrain_ids, emb, lbl, device,
+                                                     HPARAM_SEARCH_TRIALS_STAGE_A)
+
+        print(f"Stage A: 5-fold CV on {len(pretrain_ids)} studies  "
+              f"(lr={stage_a_hparams['lr']:.2e}, weight_decay={stage_a_hparams['weight_decay']:.2e})")
         stage_a_table  = pd.DataFrame({"study": pretrain_ids})
         stage_a_gkf    = GroupKFold(n_splits=5)
         stage_a_models = []
@@ -1083,7 +1177,7 @@ def main():
                                       lbl[lbl["StudyInstanceUID"].isin(sa_va_ids)])
             print(f"\nStage A FOLD {sa_fold}  train={len(pre_tr_ds)}  val={len(pre_va_ds)}")
 
-            sa_model = train_fold(pre_tr_ds, pre_va_ds, device, epochs=30)
+            sa_model, _ = train_fold(pre_tr_ds, pre_va_ds, device, epochs=30, **stage_a_hparams)
 
             # evaluate this fold
             sa_model.eval()
@@ -1122,6 +1216,13 @@ def main():
     real_lbl = lbl[lbl["StudyInstanceUID"].isin(real_ids_common)].copy()
     real_emb = emb[emb["StudyInstanceUID"].isin(real_ids_common)].copy()
 
+    stage_b_hparams = {"lr": 2e-5, "weight_decay": 1e-4}
+    if RUN_HPARAM_SEARCH:
+        stage_b_hparams = search_stage_b_hparams(real_emb, real_lbl, pretrained_model.state_dict(),
+                                                  device, HPARAM_SEARCH_TRIALS_STAGE_B)
+    print(f"Stage B hyperparameters: lr={stage_b_hparams['lr']:.2e}, "
+          f"weight_decay={stage_b_hparams['weight_decay']:.2e}")
+
     ids      = np.array(sorted(real_ids_common))
     table    = pd.DataFrame({"study": ids})
     n_splits = min(5, len(ids))
@@ -1147,7 +1248,7 @@ def main():
             # start from Stage A (weak-label pretrained) weights, then fine-tune
             fold_model = SlotAttentionModel().to(device)
             fold_model = load_state_dict_safe(fold_model, pretrained_model.state_dict())
-            fold_model = finetune_fold(fold_model, tr_ds, va_ds, device, epochs=15, lr=2e-5)
+            fold_model, _ = finetune_fold(fold_model, tr_ds, va_ds, device, epochs=15, **stage_b_hparams)
 
         fold_model.eval()
         Y, P = [], []
