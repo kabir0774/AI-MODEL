@@ -35,7 +35,7 @@ IS_KAGGLE     = os.path.exists("/kaggle/input")
 
 # Linux SSH/GPU server (not Kaggle, not the local Windows dev machine).
 # Same server layout used by RSNA v4.
-IS_SERVER     = (not IS_KAGGLE) and os.name == "posix" and Path.home().joinpath("rsna_knee_ai").exists()
+IS_SERVER     = (not IS_KAGGLE) and os.name == "posix"
 SERVER_ROOT   = Path("/home/harleen_ece/rsna_knee_ai")
 
 def _find_data_root():
