@@ -34,7 +34,7 @@ IS_KAGGLE     = os.path.exists("/kaggle/input")
 # the project folder present at ~/rsna_knee_ai. Falls back to the Windows
 # branch if that folder isn't there, so this stays safe on your PC too.
 IS_SERVER     = (not IS_KAGGLE) and os.name == "posix" and Path.home().joinpath("rsna_knee_ai").exists()
-SERVER_ROOT   = Path.home() / "rsna_knee_ai"
+SERVER_ROOT   = Path("/home/harleen_ece/rsna_knee_ai")
 
 def _find_data_root():
     # Handles both the raw competition dataset and a manually-renamed copy.
@@ -65,7 +65,7 @@ def _find_data_root():
 if IS_KAGGLE:
     DATA_ROOT = _find_data_root()
 elif IS_SERVER:
-    DATA_ROOT = SERVER_ROOT / "DATA"
+    DATA_ROOT = Path("/home/harleen_ece/rsna_knee_ai/DATA")
 else:
     DATA_ROOT = Path("C:/kabir/RSNA_Knee_AI/DATA")
 # auto-find MedSigLIP on Kaggle — handles subfolder variations
@@ -99,7 +99,7 @@ def _find_medsiglip():
 if IS_KAGGLE:
     MODEL_PATH = _find_medsiglip()
 elif IS_SERVER:
-    MODEL_PATH = SERVER_ROOT / "MedSigLIP"
+    MODEL_PATH = Path("/home/harleen_ece/rsna_knee_ai/MedSigLIP")
 else:
     MODEL_PATH = Path("C:/kabir/RSNA_Knee_AI/MedSigLIP")
 
@@ -190,7 +190,7 @@ if IS_KAGGLE:
     _parsed_candidates.append(DATA_ROOT / "final_labels_real_plus_generated.csv")
     PARSED_LABELS_CSV = next((p for p in _parsed_candidates if p.exists()), _parsed_candidates[0])
 elif IS_SERVER:
-    PARSED_LABELS_CSV = SERVER_ROOT / "parser" / "output" / "final_labels_real_plus_generated.csv"
+    PARSED_LABELS_CSV = Path("/home/harleen_ece/rsna_knee_ai/AI-MODEL/final_labels_real_plus_generated.csv")
 else:
     PARSED_LABELS_CSV = Path(r"C:\kabir\RSNA_Knee_AI\parser\output\final_labels_real_plus_generated.csv")
 
