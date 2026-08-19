@@ -108,7 +108,7 @@ else:
 if IS_KAGGLE:
     WORK_DIR = Path("/kaggle/working")
 elif IS_SERVER:
-    WORK_DIR = SERVER_ROOT / "kaggle_run"
+    WORK_DIR = SERVER_ROOT / "rsnav4_ssh"  # all cache/output goes here
 else:
     WORK_DIR = Path("C:/kabir/RSNA/kaggle_run")
 TRAIN_SERIES  = DATA_ROOT / "train_series"
@@ -176,7 +176,12 @@ if IS_KAGGLE:
 # Big zip holding the (mostly-unlabeled) train series that are NOT already
 # unzipped on disk. Only used LOCALLY — on Kaggle, data is already unzipped
 # (mounted read-only from the attached Dataset), so this path is unused there.
-TRAIN_SERIES_ZIP = Path(r"D:\rsna-knee-abnormality-detection.zip") if not IS_KAGGLE else None
+if IS_KAGGLE:
+    TRAIN_SERIES_ZIP = None
+elif IS_SERVER:
+    TRAIN_SERIES_ZIP = None  # data already extracted on SSH server
+else:
+    TRAIN_SERIES_ZIP = Path(r"D:\rsna-knee-abnormality-detection.zip")
 
 # Parser output (weak labels for everyone + real labels for 58) produced by
 # train_and_predict.py / report_parser.py. This REPLACES train.csv as the
@@ -1109,33 +1114,42 @@ def main():
 
     print("\n── TRAIN: Scan DICOMs ──")
     _cached_dcm_idx = WORK_DIR / "train_dicom_index.csv"
-    if _cached_dcm_idx.exists():
-        print(f"  Reusing cached DICOM index: {_cached_dcm_idx}")
-        train_dcm = pd.read_csv(_cached_dcm_idx, dtype=str)
-    else:
-        train_study_filter = set(labeled["StudyInstanceUID"].astype(str).tolist())
-        train_dcm = scan_dicoms(TRAIN_SERIES, train_series_csv, study_filter=train_study_filter)
-        train_dcm.to_csv(_cached_dcm_idx, index=False)
+    _cached_emb_idx = WORK_DIR / "train_embedding_index.csv"
 
-    print("\n── TRAIN: Build slots ──")
-    _cached_slots = WORK_DIR / "train_slots_cache.pkl"
-    if _cached_slots.exists():
-        print(f"  Reusing cached slots: {_cached_slots}")
-        with open(_cached_slots, "rb") as f:
-            train_slots, train_lat = pickle.load(f)
+    # ── FULL SKIP: if both DICOM index + embedding index already exist,
+    #    skip scan → laterality → slots → embed entirely (saves ~30 min) ──
+    if _cached_dcm_idx.exists() and _cached_emb_idx.exists():
+        print("  Found existing DICOM + embedding index — skipping scan/slot/embed steps")
+        train_dcm     = pd.read_csv(_cached_dcm_idx, dtype=str)
+        train_emb_idx = pd.read_csv(_cached_emb_idx, dtype=str)
     else:
-        train_lat   = detect_laterality(train_dcm)
-        train_slots = assign_slots(train_dcm)
-        train_slots["laterality"] = train_slots["StudyInstanceUID"].map(train_lat)
-        with open(_cached_slots, "wb") as f:
-            pickle.dump((train_slots, train_lat), f)
-        print(f"  Cached slots to: {_cached_slots}")
+        if _cached_dcm_idx.exists():
+            print(f"  Reusing cached DICOM index: {_cached_dcm_idx}")
+            train_dcm = pd.read_csv(_cached_dcm_idx, dtype=str)
+        else:
+            train_study_filter = set(labeled["StudyInstanceUID"].astype(str).tolist())
+            train_dcm = scan_dicoms(TRAIN_SERIES, train_series_csv, study_filter=train_study_filter)
+            train_dcm.to_csv(_cached_dcm_idx, index=False)
 
-    print("\n── TRAIN: Embed ──")
-    processor, model_enc, device_enc = load_medsiglip()
-    train_emb_idx = embed_slots(train_slots, train_dcm, processor, model_enc,
-                                 device_enc, train_lat, EMB_DIR / "train")
-    train_emb_idx.to_csv(WORK_DIR / "train_embedding_index.csv", index=False)
+        print("\n── TRAIN: Build slots ──")
+        _cached_slots = WORK_DIR / "train_slots_cache.pkl"
+        if _cached_slots.exists():
+            print(f"  Reusing cached slots: {_cached_slots}")
+            with open(_cached_slots, "rb") as f:
+                train_slots, train_lat = pickle.load(f)
+        else:
+            train_lat   = detect_laterality(train_dcm)
+            train_slots = assign_slots(train_dcm)
+            train_slots["laterality"] = train_slots["StudyInstanceUID"].map(train_lat)
+            with open(_cached_slots, "wb") as f:
+                pickle.dump((train_slots, train_lat), f)
+            print(f"  Cached slots to: {_cached_slots}")
+
+        print("\n── TRAIN: Embed ──")
+        processor, model_enc, device_enc = load_medsiglip()
+        train_emb_idx = embed_slots(train_slots, train_dcm, processor, model_enc,
+                                     device_enc, train_lat, EMB_DIR / "train")
+        train_emb_idx.to_csv(WORK_DIR / "train_embedding_index.csv", index=False)
     del model_enc; torch.cuda.empty_cache()
 
     # ══ STAGE A — PRETRAIN ON WEAK LABELS (all 4340: 58 real + weak) ═══
